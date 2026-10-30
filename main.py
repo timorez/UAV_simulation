@@ -1,6 +1,7 @@
 from coppeliasim_zmqremoteapi_client import RemoteAPIClient
 import math
 import os
+import asyncio
 from enum import Enum
 from time import monotonic, sleep
 
@@ -35,7 +36,7 @@ class Quadrocopter():
     def get_position(self):
         return sim.getObjectPosition(self.handle, sim.handle_world)
 
-    def move_to(self, x: float, y: float, z: float, timeout: float = 60.0):
+    async def move_to(self, x: float, y: float, z: float, timeout: float = 60.0):
         """Плавно перемещает target и ждёт, пока коптер достигнет точки."""
         target_pos = [x, y, z]
         start_pos = sim.getObjectPosition(self.tgt_handle, sim.handle_world)
@@ -52,7 +53,7 @@ class Quadrocopter():
                 ]
                 sim.setObjectPosition(self.tgt_handle, sim.handle_world, current_pos)
                 self.pos = current_pos
-                sleep(self.step_time)
+                await asyncio.sleep(self.step_time)
 
             deadline = monotonic() + timeout
             while True:
@@ -62,16 +63,16 @@ class Quadrocopter():
                     break
                 if monotonic() >= deadline:
                     raise TimeoutError(f'Коптер не достиг точки {target_pos}')
-                sleep(self.step_time)
+                await asyncio.sleep(self.step_time)
         finally:
             self.state = State.IDLE
 
-    def move_vector(self, x: float = 0, y: float = 0, z: float = 0):
+    async def move_vector(self, x: float = 0, y: float = 0, z: float = 0):
         """Перемещает коптер на заданный вектор относительно target."""
-        self.move_to(self.pos[0] + x, self.pos[1] + y, self.pos[2] + z)
+        await self.move_to(self.pos[0] + x, self.pos[1] + y, self.pos[2] + z)
 
-    def change_alt(self, alt: float):
-        self.move_to(self.pos[0], self.pos[1], self.pos[2] + alt)
+    async def change_alt(self, alt: float):
+        await self.move_to(self.pos[0], self.pos[1], self.pos[2] + alt)
 
     def get_distance(self, x: float, y: float, z: float):
         target_pos = [x, y, z]
@@ -85,21 +86,22 @@ class Quadrocopter():
         
         return distance
 
-    def fly_to_pois(self):
+    async def fly_to_pois(self, pool):
         pois = get_poi_positions()
         if not pois:
             print('В сцене не найдены точки интереса')
             return
 
-        while pois:
-            index, position = min(
-                pois,
-                key=lambda poi: self.get_distance(*poi[1])
+        while pool:
+            closest_poi = min(
+                pool, key=lambda poi: self.get_distance(*poi[1])
             )
-            pois.remove((index, position))
-            print(f'Лечу к POI_{index}: {position}')
-            print(f'Дистанция: {self.get_distance(*position)}')
-            self.move_to(*position)
+
+            pool.remove(closest_poi)
+            index, position = closest_poi
+
+            print(f'[{self.handle}] Лечу к POI_{index}: {position}')
+            await self.move_to(*position)
 
 
 def get_poi_positions():
@@ -118,7 +120,7 @@ def get_poi_positions():
     return sorted(pois, key=lambda poi: poi[0])
 
 
-def main():
+async def main():
     name = input('Введите имя сцены для загрузки: ')
     path = os.path.join(os.getcwd(), f'{name}.ttt')
 
@@ -128,16 +130,22 @@ def main():
         pass
 
     while sim.getSimulationState() != sim.simulation_stopped:
-        sleep(0.1)
+         await asyncio.sleep(0.1)
     sim.loadScene(path)
 
-    quad = Quadrocopter('/Quadcopter')
+    targets_pool = get_poi_positions()
+
+    quad0 = Quadrocopter('/Quadcopter[0]')
+    quad1 = Quadrocopter('/Quadcopter[1]')
+
     sim.startSimulation()
     try:
-        quad.fly_to_pois()
+        await asyncio.gather(
+            quad0.fly_to_pois(targets_pool), quad1.fly_to_pois(targets_pool)
+        )
     finally:
         sim.stopSimulation()
 
 
 if __name__ == '__main__':
-    main()
+    asyncio.run(main())
