@@ -1,3 +1,5 @@
 .venv
 test.ttt
 test_poi.ttt
+test_poi_large.ttt
+__pycache__
