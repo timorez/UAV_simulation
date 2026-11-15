@@ -35,10 +35,15 @@ class Quadcopter:
             self.tgt_handle = self.sim.getObject(f'{path}/target')
             self.altimeter = self.sim.getObject(f'{path}/proximitySensor')
             self.front_camera = self.sim.getObject(f'{path}/visionSensor')
-            self.accelerometer = self.sim.getObject(f'{path}/Accelerometer')
+            self.accelerometer = self.sim.getObject(f'{path}/Accelerometer/forceSensor')
             self.gyro = self.sim.getObject(f'{path}/GyroSensor')
         except Exception as e:
             raise RuntimeError('Не удалось подключиться к дрону') from e
+
+        self.accel_bias = [0.0, 0.0, 0.0]
+        self.gyro_bias = [0.0, 0.0, 0.0]
+        
+        self.gravity = [0.0, 0.0, -9.81]
 
         self.pos = self.sim.getObjectPosition(self.tgt_handle, self.sim.handle_world)
         self.state = State.IDLE
@@ -54,7 +59,41 @@ class Quadcopter:
 
         self.claimed_tgt = None
         self.network: list[Quadcopter] = []
+        self._sim_lock = asyncio.Lock()
 
+
+    async def start(self):
+        init_pos = await self.async_sim_call(
+            self.sim.getObjectPosition, self.handle, self.sim.handle_world)
+        init_quat = await self.async_sim_call(
+            self.sim.getObjectQuaternion, self.handle, self.sim.handle_world)
+
+        self.ins_pos = list(init_pos)
+        self.ins_vel = [0.0, 0.0, 0.0]
+        self.ins_quat = list(init_quat)
+
+        self._prev_pos = None
+        self._prev_vel = None
+        self._prev_quat = None
+
+        self._ins_task = asyncio.create_task(self._ins_loop())
+        print(f'[{self.handle}] Дрон запущен, ИНС активна')
+
+    async def stop(self):
+        """Остановка дрона и всех фоновых задач."""
+        if hasattr(self, '_ins_task') and not self._ins_task.done():
+            self._ins_task.cancel()
+            try:
+                await self._ins_task
+            except asyncio.CancelledError:
+                pass
+        print(f'[{self.handle}] Дрон остановлен')
+
+    async def _ins_loop(self):
+        """Фоновый цикл обновления ИНС с частотой симуляции."""
+        while True:
+            await self.update_ins()
+            await asyncio.sleep(self.step_time)
 
     def set_network(self, all_drones: list):
         self.network = [d for d in all_drones if d != self]
@@ -89,8 +128,8 @@ class Quadcopter:
 
 
     async def get_position(self):
-        return await self.async_sim_call(self.sim.getObjectPosition, self.handle, self.sim.handle_world)
-    
+        return await self.async_sim_call(
+            self.sim.getObjectPosition, self.handle, self.sim.handle_world)
 
     async def angle_to_target(self, target_pos):
         drone_pos = await self.get_position()
@@ -197,6 +236,107 @@ class Quadcopter:
     def get_alt(self):
         detected, distance, *_ = self.sim.readProximitySensor(self.altimeter)
         return distance if detected else None
+
+
+    @staticmethod
+    def _quat_multiply(q1, q2):
+        """Умножение кватернионов [x, y, z, w]."""
+        x1, y1, z1, w1 = q1
+        x2, y2, z2, w2 = q2
+        return [
+            w1*x2 + x1*w2 + y1*z2 - z1*y2,
+            w1*y2 - x1*z2 + y1*w2 + z1*x2,
+            w1*z2 + x1*y2 - y1*x2 + z1*w2,
+            w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        ]
+
+    @staticmethod
+    def _quat_normalize(q):
+        n = math.sqrt(sum(c*c for c in q))
+        if n < 1e-9:
+            return [0.0, 0.0, 0.0, 1.0]
+        return [c / n for c in q]
+
+    @staticmethod
+    def _quat_rotate_vector(q, v):
+        """Поворот вектора v кватернионом q [x,y,z,w]."""
+        x, y, z, w = q
+        # q * v * q_conjugate
+        vx, vy, vz = v
+        # t = 2 * cross(q.xyz, v)
+        tx = 2.0 * (y * vz - z * vy)
+        ty = 2.0 * (z * vx - x * vz)
+        tz = 2.0 * (x * vy - y * vx)
+        return [
+            vx + w * tx + (y * tz - z * ty),
+            vy + w * ty + (z * tx - x * tz),
+            vz + w * tz + (x * ty - y * tx),
+        ]
+
+
+    async def update_ins(self):
+        dt = self.step_time
+
+        async with self._sim_lock:
+            ax = await self.async_sim_call(self.sim.getFloatSignal, 'accelX')
+            ay = await self.async_sim_call(self.sim.getFloatSignal, 'accelY')
+            az = await self.async_sim_call(self.sim.getFloatSignal, 'accelZ')
+            
+            gx = await self.async_sim_call(self.sim.getFloatSignal, 'gyroX')
+            gy = await self.async_sim_call(self.sim.getFloatSignal, 'gyroY')
+            gz = await self.async_sim_call(self.sim.getFloatSignal, 'gyroZ')
+
+            true_pos = await self.async_sim_call(
+                self.sim.getObjectPosition, self.handle, self.sim.handle_world)
+
+        # Если сигналы еще не инициализированы (None), пропускаем шаг
+        if ax is None or gx is None:
+            return
+
+        accel_raw = [ax, ay, az]
+        gyro_raw = [gx, gy, gz]
+        
+        # === Математика ===
+        accel = [accel_raw[i] - self.accel_bias[i] for i in range(3)]
+        gyro = [gyro_raw[i] - self.gyro_bias[i] for i in range(3)]
+
+        wx, wy, wz = gyro
+        angle = math.sqrt(wx*wx + wy*wy + wz*wz) * dt
+        if angle > 1e-9:
+            half_angle = angle * 0.5
+            s = math.sin(half_angle) / (angle * 0.5)
+            delta_q = [wx * dt * 0.5 * s,
+                       wy * dt * 0.5 * s,
+                       wz * dt * 0.5 * s,
+                       math.cos(half_angle)]
+        else:
+            delta_q = [wx * dt * 0.5, wy * dt * 0.5, wz * dt * 0.5, 1.0]
+
+        self.ins_quat = self._quat_normalize(
+            self._quat_multiply(self.ins_quat, delta_q)
+        )
+
+        accel_world = self._quat_rotate_vector(self.ins_quat, accel)
+        accel_world = [accel_world[i] + self.gravity[i] for i in range(3)]
+
+        for i in range(3):
+            self.ins_vel[i] += accel_world[i] * dt
+            self.ins_pos[i] += self.ins_vel[i] * dt
+
+        true_pos = await self.async_sim_call(
+            self.sim.getObjectPosition, self.handle, self.sim.handle_world)
+
+        alpha_pos = 0.3
+        alpha_vel = 0.5
+        for i in range(3):
+            pos_err = true_pos[i] - self.ins_pos[i]
+            self.ins_pos[i] += pos_err * alpha_pos
+            self.ins_vel[i] += pos_err * alpha_vel
+
+    def get_ins_position(self):
+        """Возвращает текущую оценку позиции от ИНС."""
+        return list(self.ins_pos)
+    
 
     async def fly_to_pois(self):
         if not self.known_pois:
