@@ -40,12 +40,12 @@ async def main():
          
     await utl.async_sim_call(sim.loadScene, path)
 
-    targets_pool = [quadcopter.Task(_) for _ in await utl.async_sim_call(get_poi_positions)]
+    targets_pool = [quadcopter.POI(_) for _ in await utl.async_sim_call(get_poi_positions)]
 
-    quad0 = quadcopter.Quadcopter('/Quadcopter[0]', targets_pool, sim, utl.async_sim_call)
-    quad1 = quadcopter.Quadcopter('/Quadcopter[1]', targets_pool, sim, utl.async_sim_call)
-    quad2 = quadcopter.Quadcopter('/Quadcopter[2]', targets_pool, sim, utl.async_sim_call)
-    quad3 = quadcopter.Quadcopter('/Quadcopter[3]', targets_pool, sim, utl.async_sim_call)
+    quad0 = quadcopter.Quadcopter('/Quadcopter[0]', targets_pool, sim, utl.async_sim_call, rotation_speed=10)
+    quad1 = quadcopter.Quadcopter('/Quadcopter[1]', targets_pool, sim, utl.async_sim_call, rotation_speed=10)
+    quad2 = quadcopter.Quadcopter('/Quadcopter[2]', targets_pool, sim, utl.async_sim_call, rotation_speed=10)
+    quad3 = quadcopter.Quadcopter('/Quadcopter[3]', targets_pool, sim, utl.async_sim_call, rotation_speed=10)
 
     all_drones = [quad0, quad1, quad2, quad3]
     for quad in all_drones:
@@ -53,13 +53,18 @@ async def main():
 
     await utl.async_sim_call(sim.startSimulation)
     try:
-        await asyncio.gather(
-            quad0.fly_to_pois(), 
-            quad1.fly_to_pois(), 
-            quad2.fly_to_pois(), 
-            quad3.fly_to_pois()
-        )
+        await quad0.start()
+        await quad1.start()
+        await quad2.start()
+        await quad3.start()
+
+        await asyncio.sleep(55)
+
     finally:
+        await quad0.stop()
+        await quad1.stop()
+        await quad2.stop()
+        await quad3.stop()
         await utl.async_sim_call(sim.stopSimulation)
 
 

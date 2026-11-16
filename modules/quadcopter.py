@@ -8,6 +8,7 @@ from time import monotonic
 class State(Enum):
     IDLE = 0
     MOVING = 1
+    NOT_RESPONDING = 3
 
 
 class TaskStatus(Enum):
@@ -16,7 +17,7 @@ class TaskStatus(Enum):
     FINISHED = 2
 
 
-class Task:
+class POI:
     def __init__(self, poi):
         self.index = poi[0]
         self.pos = poi[1]
@@ -27,7 +28,7 @@ class Task:
 
 
 class Quadcopter:
-    def __init__(self, path: str, all_pois: list, sim_proxy, async_sim_call):
+    def __init__(self, path: str, all_pois: list[POI], sim_proxy, async_sim_call, speed: float = 15, rotation_speed: float = 5):
         self.sim = sim_proxy
         self.async_sim_call = async_sim_call
         try:
@@ -47,22 +48,49 @@ class Quadcopter:
 
         self.pos = self.sim.getObjectPosition(self.tgt_handle, self.sim.handle_world)
         self.state = State.IDLE
-        self.speed = 15
-        self.rotation_speed = 5
+        self.speed = speed
+        self.rotation_speed = rotation_speed
         self.step_time = 0.005
         self.tolerance = 0.25
+        self.ping_timestamp = monotonic()
 
         self.known_pois = {
-            poi.index: {'pos': poi.pos, 'status': poi.status, 'by_whom': None}
+            poi.index: {'position': poi.pos, 'status': poi.status, 'by_whom': None}
             for poi in all_pois
         }
 
         self.claimed_tgt = None
-        self.network: list[Quadcopter] = []
+        self.network: dict[int, dict[str, State | list | int | Quadcopter | float | None]] = {}
+        """Инфа о соседях {handle: {state, position, claimed_tgt, inst, timestamp}}"""
+
         self._sim_lock = asyncio.Lock()
 
 
+    def set_network(self, all_drones: list[Quadcopter]):
+        """Инициализация сети"""
+        for d in all_drones:
+            if d.handle != self.handle:
+                self.network[d.handle] = {
+                    'state': d.state,
+                    'position': d.pos,
+                    'claimed_tgt': d.claimed_tgt,
+                    'inst': d,
+                    'timestamp': monotonic()
+                }
+
+    async def create_message(self):
+        """Формирование сообщения для пинга"""
+        return {
+                'sender': self.handle,
+                'state': self.state,
+                'position': await self.get_position(),
+                'claimed_tgt': self.claimed_tgt,
+                'timestamp': self.ping_timestamp
+            }
+
+
     async def start(self):
+        """Запуск фоновых задач."""
         init_pos = await self.async_sim_call(
             self.sim.getObjectPosition, self.handle, self.sim.handle_world)
         init_quat = await self.async_sim_call(
@@ -72,22 +100,23 @@ class Quadcopter:
         self.ins_vel = [0.0, 0.0, 0.0]
         self.ins_quat = list(init_quat)
 
-        self._prev_pos = None
-        self._prev_vel = None
-        self._prev_quat = None
-
-        self._ins_task = asyncio.create_task(self._ins_loop())
+        self._tasks = [
+            asyncio.create_task(self._ins_loop(),       name='ins'),
+            asyncio.create_task(self._ping_loop(),      name='ping'),
+            asyncio.create_task(self._targeting_loop(), name='tgt'),
+            asyncio.create_task(self._action_loop(),    name='action')
+        ]
         print(f'[{self.handle}] Дрон запущен, ИНС активна')
+
 
     async def stop(self):
         """Остановка дрона и всех фоновых задач."""
-        if hasattr(self, '_ins_task') and not self._ins_task.done():
-            self._ins_task.cancel()
-            try:
-                await self._ins_task
-            except asyncio.CancelledError:
-                pass
+        for t in getattr(self, '_tasks', []):
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
         print(f'[{self.handle}] Дрон остановлен')
+
 
     async def _ins_loop(self):
         """Фоновый цикл обновления ИНС с частотой симуляции."""
@@ -95,37 +124,118 @@ class Quadcopter:
             await self.update_ins()
             await asyncio.sleep(self.step_time)
 
-    def set_network(self, all_drones: list):
-        self.network = [d for d in all_drones if d != self]
+
+    async def _ping_loop(self):
+        """Фоновый цикл с пингами"""
+        while True:
+            self.ping_timestamp = monotonic()
+            msg = await self.create_message()
+            tasks = [d['inst'].recieve_ping(msg) for d in self.network.values()]
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+            for handle, info in self.network.items():
+                if info['state'] != State.NOT_RESPONDING:
+                    if self.ping_timestamp - info['timestamp'] > 5:
+                        info['state'] = State.NOT_RESPONDING
+                        print(f'[{self.handle}]: дрон {handle} помечен как вышедший из строя т.к не обновлял свой статус в течении 15 секунд')
+                    else:
+                        print(f'[{self.handle}]: Активные дроны: {self.network.keys()}')
+
+            
+            await asyncio.sleep(2)
+
+
+    async def _targeting_loop(self):
+        """Цикл выбора целей"""
+        while True:
+            if self.state == State.IDLE:
+                if len(self.known_pois) == 0:
+                    print(f'[{self.handle}]: Нет известных целей, завершаю цикл поиска')
+                    break
+
+                claimed_idx = None
+                distance = None
+                for tgt_idx, tgt_info in self.known_pois.items():
+                    if tgt_info['status'] == TaskStatus.FREE:
+                        d = await self.get_distance(*tgt_info['position'])
+                        if claimed_idx is None:
+                            claimed_idx = tgt_idx
+                            distance = d
+                        elif d < distance:
+                            claimed_idx = tgt_idx
+                            distance = d
+
+                response = []
+                
+                for handle, info in self.network.items():
+                    if info['state'] != State.NOT_RESPONDING:
+                        response.append(await info['inst'].recieve_claim(self.handle, claimed_idx, distance))
+
+                if 'REJECTED' in response:
+                    print(f'[{self.handle}]: не удалось занять цель {claimed_idx}')
+                    continue
+                else:
+                    print(f'[{self.handle}]: Занимаю цель {claimed_idx}')
+                    self.claimed_tgt = claimed_idx
+
+                    self.known_pois[self.claimed_tgt]['status'] = TaskStatus.IN_PROGRESS
+                    self.known_pois[self.claimed_tgt]['by_whom'] = self.handle
+
+                    msg = await self.create_message()
+                    tasks = [d['inst'].recieve_ping(msg) for d in self.network.values()]
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
+            await asyncio.sleep(3)
+
+
+    async def _action_loop(self):
+        """Цикл действий"""
+        while True:
+            if self.claimed_tgt is not None:
+                x, y, z = self.known_pois[self.claimed_tgt]['position']
+                arrival = await self.move_to(x, y, z)
+                msg = await self.create_message()
+                
+                tasks = [d['inst'].recieve_ping(msg) for d in self.network.values()]
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+                if arrival:
+                    print(f'[{self.handle}]: Выполнил цель {self.claimed_tgt}')
+                    msg = await self.create_message()
+                    tasks = [d['inst'].recieve_done(self.claimed_tgt) for d in self.network.values()]
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
+                    tasks = [d['inst'].recieve_ping(msg) for d in self.network.values()]
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    self.claimed_tgt = None
+                    
+            await asyncio.sleep(1)
+                
+
+    async def recieve_done(self, tgt):
+        """Получение уведомления о выполненой задаче"""
+        self.known_pois[tgt]['status'] = TaskStatus.FINISHED
+
+    async def recieve_ping(self, msg: dict):
+        """Получение обновлений от дронов из сети"""
+        self.network[msg['sender']]['state'] = msg['state']
+        self.network[msg['sender']]['position'] = msg['position']
+        self.network[msg['sender']]['claimed_tgt'] = msg['claimed_tgt']
+        self.network[msg['sender']]['timestamp'] = msg['timestamp']
+        if msg['claimed_tgt'] is not None and msg['claimed_tgt'] in self.known_pois:
+            self.known_pois[msg['claimed_tgt']]['by_whom'] = msg['sender']
+            self.known_pois[msg['claimed_tgt']]['status'] = TaskStatus.IN_PROGRESS
 
 
     async def recieve_claim(self, sender_handle, claimed_idx, claimed_distance):
-        if self.known_pois[claimed_idx]['status'] == TaskStatus.FINISHED:
+        """Получение заявки на цель"""
+        distance = await self.get_distance(*self.known_pois[claimed_idx]['position'])
+
+        if self.state == State.IDLE and distance < claimed_distance:
             return 'REJECTED'
-        
-        my_dist = await self.get_distance(*self.known_pois[claimed_idx]['pos'])
-        
-        if self.claimed_tgt == claimed_idx:
-            if (claimed_distance) < ((my_dist) * 0.8):
-                print(f'[{self.handle}]: уступаю  цель {self.claimed_tgt} [{sender_handle}]')
-                self.known_pois[claimed_idx]['status'] = TaskStatus.IN_PROGRESS
-                self.known_pois[claimed_idx]['by_whom'] = sender_handle
-                self.claimed_tgt = None
-                return 'ACCEPTED'
-            else:
-                print(f'[{self.handle}]: забираю  цель {self.claimed_tgt} у [{sender_handle}]')
-                return 'REJECTED'
-
-        print(f'[{self.handle}]: получил обновление по цели {claimed_idx} от [{sender_handle}]')
-        self.known_pois[claimed_idx]['status'] = TaskStatus.IN_PROGRESS
-        self.known_pois[claimed_idx]['by_whom'] = sender_handle
-        return 'UPDATED'
+        else:
+            return 'ACCEPTED'
     
-
-    def receive_done_signal(self, poi_idx):
-        """Уведомление от соседа, что точка выполнена."""
-        self.known_pois[poi_idx]['status'] = TaskStatus.FINISHED
-
 
     async def get_position(self):
         return await self.async_sim_call(
@@ -295,8 +405,8 @@ class Quadcopter:
 
         accel_raw = [ax, ay, az]
         gyro_raw = [gx, gy, gz]
-        
-        # === Математика ===
+
+        # Математика
         accel = [accel_raw[i] - self.accel_bias[i] for i in range(3)]
         gyro = [gyro_raw[i] - self.gyro_bias[i] for i in range(3)]
 
@@ -336,56 +446,3 @@ class Quadcopter:
     def get_ins_position(self):
         """Возвращает текущую оценку позиции от ИНС."""
         return list(self.ins_pos)
-    
-
-    async def fly_to_pois(self):
-        if not self.known_pois:
-            print(f'[{self.handle}] В сцене не найдены точки интереса')
-            return
-
-        while any(info['status'] == TaskStatus.FREE for info in self.known_pois.values()):
-            if self.claimed_tgt is not None:
-                await asyncio.sleep(0.2)
-                continue
-
-            free_pois = {
-                idx: info
-                for idx, info in self.known_pois.items()
-                if info['status'] == TaskStatus.FREE and idx != self.claimed_tgt
-            }
-
-            if not free_pois:
-                await asyncio.sleep(0.5)
-                continue
-
-            distances = {}
-            for idx in free_pois.keys():
-                distances[idx] = await self.get_distance(*free_pois[idx]['pos'])
-            
-            best_idx = min(distances, key=distances.get)
-            my_dist = distances[best_idx]
-
-            self.claimed_tgt = best_idx
-            conflict = False
-
-            for drone in self.network:
-                response = await drone.recieve_claim(self.handle, best_idx, my_dist)
-                if response == 'REJECTED':
-                    conflict = True
-
-            if conflict:
-                self.claimed_tgt = None
-                await asyncio.sleep(0.1)
-                continue
-
-            poi_pos = self.known_pois[best_idx]['pos']
-
-            success = await self.move_to(*poi_pos)
-            if success and self.claimed_tgt == best_idx:
-                self.known_pois[best_idx]['status'] = TaskStatus.FINISHED
-                for drone in self.network:
-                    drone.receive_done_signal(best_idx)
-                print(f'[{self.handle}] Завершил POI_{best_idx}')
-
-            self.claimed_tgt = None
-            await asyncio.sleep(0.1)
