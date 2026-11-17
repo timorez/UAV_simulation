@@ -3,11 +3,13 @@ import math
 import asyncio
 from enum import Enum
 from time import monotonic
+import numpy as np
 
 
 class State(Enum):
     IDLE = 0
     MOVING = 1
+    DETOUR = 2
     NOT_RESPONDING = 3
 
 
@@ -34,7 +36,8 @@ class Quadcopter:
         try:
             self.handle = self.sim.getObject(path)
             self.tgt_handle = self.sim.getObject(f'{path}/target')
-            self.altimeter = self.sim.getObject(f'{path}/proximitySensor')
+            self.altimeter = self.sim.getObject(f'{path}/proximitySensor[0]')
+            self.front_sensor = self.sim.getObject(f'{path}/proximitySensor[1]')
             self.front_camera = self.sim.getObject(f'{path}/visionSensor')
             self.accelerometer = self.sim.getObject(f'{path}/Accelerometer/forceSensor')
             self.gyro = self.sim.getObject(f'{path}/GyroSensor')
@@ -52,7 +55,10 @@ class Quadcopter:
         self.rotation_speed = rotation_speed
         self.step_time = 0.005
         self.tolerance = 0.25
+        self.safe_distance = 0.5
         self.ping_timestamp = monotonic()
+
+        self._obstacle_flag = False
 
         self.known_pois = {
             poi.index: {'position': poi.pos, 'status': poi.status, 'by_whom': None}
@@ -77,9 +83,11 @@ class Quadcopter:
                     'inst': d,
                     'timestamp': monotonic()
                 }
+                
 
     async def create_message(self):
         """Формирование сообщения для пинга"""
+
         return {
                 'sender': self.handle,
                 'state': self.state,
@@ -104,7 +112,8 @@ class Quadcopter:
             asyncio.create_task(self._ins_loop(),       name='ins'),
             asyncio.create_task(self._ping_loop(),      name='ping'),
             asyncio.create_task(self._targeting_loop(), name='tgt'),
-            asyncio.create_task(self._action_loop(),    name='action')
+            asyncio.create_task(self._action_loop(),    name='action'),
+            asyncio.create_task(self._sensor_loop(),    name='sensor'),
         ]
         print(f'[{self.handle}] Дрон запущен, ИНС активна')
 
@@ -123,6 +132,17 @@ class Quadcopter:
         while True:
             await self.update_ins()
             await asyncio.sleep(self.step_time)
+
+
+    async def _sensor_loop(self):
+        while True:
+            front_distance = await self.read_front_sensor()
+            if front_distance is not None:
+                print(front_distance)
+                if front_distance <= self.safe_distance:
+                    self._obstacle_flag = True
+
+            await asyncio.sleep(0.5)
 
 
     async def _ping_loop(self):
@@ -195,11 +215,11 @@ class Quadcopter:
                 x, y, z = self.known_pois[self.claimed_tgt]['position']
                 arrival = await self.move_to(x, y, z)
                 msg = await self.create_message()
-                
+
                 tasks = [d['inst'].recieve_ping(msg) for d in self.network.values()]
                 await asyncio.gather(*tasks, return_exceptions=True)
 
-                if arrival:
+                if arrival == 'FINISHED':
                     print(f'[{self.handle}]: Выполнил цель {self.claimed_tgt}')
                     msg = await self.create_message()
                     tasks = [d['inst'].recieve_done(self.claimed_tgt) for d in self.network.values()]
@@ -208,7 +228,27 @@ class Quadcopter:
                     tasks = [d['inst'].recieve_ping(msg) for d in self.network.values()]
                     await asyncio.gather(*tasks, return_exceptions=True)
                     self.claimed_tgt = None
-                    
+
+                elif arrival == 'DETOUR':
+                    old_tgt = self.claimed_tgt
+                    self.known_pois[old_tgt]['status'] = TaskStatus.FREE
+                    self.known_pois[old_tgt]['by_whom'] = None
+                    self.claimed_tgt = None
+                        
+                    msg = await self.create_message()
+                    tasks = [d['inst'].recieve_ping(msg) for d in self.network.values()]
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                        
+                    await self._detour(offset=1.0)
+                else:
+                    print(f'[{self.handle}]: Не смог добраться до цели {self.claimed_tgt}')
+
+                    self.known_pois[self.claimed_tgt]['status'] = TaskStatus.FREE
+                    self.known_pois[self.claimed_tgt]['by_whom'] = None
+                    self.claimed_tgt = None
+                    msg = await self.create_message()
+                    tasks = [d['inst'].recieve_ping(msg) for d in self.network.values()]
+                    await asyncio.gather(*tasks, return_exceptions=True)
             await asyncio.sleep(1)
                 
 
@@ -218,6 +258,9 @@ class Quadcopter:
 
     async def recieve_ping(self, msg: dict):
         """Получение обновлений от дронов из сети"""
+        if msg['claimed_tgt'] is None:
+            self.known_pois[self.network[msg['sender']]['claimed_tgt']]['by_whom'] = None
+            self.known_pois[self.network[msg['sender']]['state']]['status'] = TaskStatus.FREE
         self.network[msg['sender']]['state'] = msg['state']
         self.network[msg['sender']]['position'] = msg['position']
         self.network[msg['sender']]['claimed_tgt'] = msg['claimed_tgt']
@@ -225,6 +268,7 @@ class Quadcopter:
         if msg['claimed_tgt'] is not None and msg['claimed_tgt'] in self.known_pois:
             self.known_pois[msg['claimed_tgt']]['by_whom'] = msg['sender']
             self.known_pois[msg['claimed_tgt']]['status'] = TaskStatus.IN_PROGRESS
+
 
 
     async def recieve_claim(self, sender_handle, claimed_idx, claimed_distance):
@@ -293,9 +337,9 @@ class Quadcopter:
                 await asyncio.sleep(self.step_time)
 
         return True
-    
 
-    async def move_to(self, x: float, y: float, z: float, timeout: float = 15.0, yaw: bool = True):
+
+    async def move_to(self, x: float, y: float, z: float, timeout: float = 15.0, yaw: bool = True, check_obstacle: bool = True):
         target_pos = [x, y, z]
         start_pos = await self.async_sim_call(self.sim.getObjectPosition, self.tgt_handle, self.sim.handle_world)
         distance = math.sqrt(sum((target_pos[i] - start_pos[i]) ** 2 for i in range(3)))
@@ -306,6 +350,10 @@ class Quadcopter:
             await self.yaw(await self.angle_to_target(target_pos))
         try:
             for step in range(1, steps + 1):
+                if self._obstacle_flag and check_obstacle:
+                    self.state = State.DETOUR
+                    return 'DETOUR'
+
                 ratio = step / steps
                 current_pos = [
                     start_pos[i] + (target_pos[i] - start_pos[i]) * ratio
@@ -320,9 +368,9 @@ class Quadcopter:
                 current_pos = await self.get_position()
                 remaining = math.sqrt(sum((target_pos[i] - current_pos[i]) ** 2 for i in range(3)))
                 if remaining <= self.tolerance:
-                    return True
+                    return 'FINISHED'
                 if monotonic() >= deadline:
-                    return False
+                    return 'NOT_FINISHED'
                 await asyncio.sleep(self.step_time)
         finally:
             self.state = State.IDLE
@@ -333,9 +381,27 @@ class Quadcopter:
         await self.move_to(self.pos[0] + x, self.pos[1] + y, self.pos[2] + z)
         
 
-    async def change_alt(self, alt: float):
-        await self.move_to(self.pos[0], self.pos[1], self.pos[2] + alt)
+    async def _detour(self, offset: float = 1.0):
+        """
+        Смещает дрон вправо относительно текущего курса на offset метров.
+        Не сбрасывает claimed_tgt — после возврата управление продолжит _action_loop.
+        """
+        pos = await self.get_position()
+        quat = await self.async_sim_call(
+            self.sim.getObjectQuaternion, self.handle, self.sim.handle_world)
+        yaw = 2.0 * math.atan2(quat[2], quat[3])
 
+        # Вектор "вправо" в мировых координатах = курс, повернутый на -90°
+        dx = math.sin(yaw) * offset
+        dy = -math.cos(yaw) * offset
+
+        print(f'[{self.handle}]: Обход препятствия, смещение вправо на {offset:.1f} м')
+
+        # yaw=False — не разворачиваем нос, продолжаем смотреть на препятствие
+        await self.move_to(pos[0] + dx, pos[1] + dy, pos[2], yaw=False, check_obstacle=False)
+
+        self._obstacle_flag = False
+        
 
     async def get_distance(self, x: float, y: float, z: float):
         target_pos = [x, y, z]
@@ -343,8 +409,12 @@ class Quadcopter:
         distance = math.sqrt(sum((target_pos[i] - self_pos[i]) ** 2 for i in range(3)))
         return distance
 
-    def get_alt(self):
-        detected, distance, *_ = self.sim.readProximitySensor(self.altimeter)
+    async def get_alt(self):
+            detected, distance, *_ = await self.async_sim_call(self.sim.readProximitySensor, self.altimeter)
+            return distance if detected else None
+
+    async def read_front_sensor(self):
+        detected, distance, *_ = await self.async_sim_call(self.sim.readProximitySensor, self.front_sensor)
         return distance if detected else None
 
 
@@ -446,3 +516,63 @@ class Quadcopter:
     def get_ins_position(self):
         """Возвращает текущую оценку позиции от ИНС."""
         return list(self.ins_pos)
+
+
+    async def get_camera_image(self):
+        """
+        Получает сырое изображение с камеры.
+        Возвращает: numpy array (H, W, 3) в формате RGB или (H, W) для grayscale.
+        """
+        try:
+            result = await self.async_sim_call(
+                self.sim.getVisionSensorCharImage, 
+                self.front_camera
+            )
+            
+            image_bytes = None
+            width = None
+            height = None
+            is_grayscale = False
+            
+            if isinstance(result, (list, tuple)):
+                if len(result) == 3:
+                    # Вариант 1: (image_bytes, width, height)
+                    # Вариант 2: (image_bytes, resolution, options)
+                    # Вариант 3: (image_bytes, resolution, is_grayscale)
+                    image_bytes = result[0]
+                    
+                    if isinstance(result[1], int):
+                        width = result[1]
+                        height = result[2]
+                        is_grayscale = False
+                    elif isinstance(result[1], (list, tuple)):
+                        # Формат (bytes, [width, height], options)
+                        width, height = result[1][0], result[1][1]
+                        is_grayscale = (result[2] == 1) if isinstance(result[2], int) else False
+                        
+                elif len(result) == 2:
+                    image_bytes = result[0]
+                    if isinstance(result[1], (list, tuple)):
+                        width, height = result[1][0], result[1][1]
+
+            if not image_bytes or len(image_bytes) == 0:
+                print(f"[{self.handle}] Пустой буфер изображения")
+                return None
+
+            img = np.frombuffer(image_bytes, dtype=np.uint8)
+            
+            expected_rgb = width * height * 3
+            expected_gray = width * height
+            
+            if len(img) == expected_rgb:
+                img = img.reshape((height, width, 3))
+            elif len(img) == expected_gray:
+                img = img.reshape((height, width))
+
+            return img
+            
+        except Exception as e:
+            print(f"[{self.handle}] Ошибка чтения камеры: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
