@@ -30,7 +30,7 @@ class POI:
 
 
 class Quadcopter:
-    def __init__(self, path: str, all_pois: list[POI], sim_proxy, async_sim_call, speed: float = 15, rotation_speed: float = 5):
+    def __init__(self, path: str, all_pois: list[POI], sim_proxy, async_sim_call, speed: float = 15, rotation_speed: float = 5, save_distance: float = 1.5):
         self.sim = sim_proxy
         self.async_sim_call = async_sim_call
         try:
@@ -55,7 +55,7 @@ class Quadcopter:
         self.rotation_speed = rotation_speed
         self.step_time = 0.005
         self.tolerance = 0.25
-        self.safe_distance = 0.5
+        self.safe_distance = save_distance
         self.ping_timestamp = monotonic()
 
         self._obstacle_flag = False
@@ -74,7 +74,7 @@ class Quadcopter:
 
     def set_network(self, all_drones: list[Quadcopter]):
         """Инициализация сети"""
-        for d in all_drones:
+        for d in all_drones: 
             if d.handle != self.handle:
                 self.network[d.handle] = {
                     'state': d.state,
@@ -128,21 +128,20 @@ class Quadcopter:
 
 
     async def _ins_loop(self):
-        """Фоновый цикл обновления ИНС с частотой симуляции."""
+        """Фоновый цикл обновления ИНС."""
         while True:
             await self.update_ins()
-            await asyncio.sleep(self.step_time)
+            await asyncio.sleep(self.step_time * 10)
 
 
     async def _sensor_loop(self):
         while True:
             front_distance = await self.read_front_sensor()
             if front_distance is not None:
-                print(front_distance)
                 if front_distance <= self.safe_distance:
                     self._obstacle_flag = True
 
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(1)
 
 
     async def _ping_loop(self):
@@ -155,14 +154,12 @@ class Quadcopter:
 
             for handle, info in self.network.items():
                 if info['state'] != State.NOT_RESPONDING:
-                    if self.ping_timestamp - info['timestamp'] > 5:
+                    if self.ping_timestamp - info['timestamp'] > 20:
                         info['state'] = State.NOT_RESPONDING
-                        print(f'[{self.handle}]: дрон {handle} помечен как вышедший из строя т.к не обновлял свой статус в течении 15 секунд')
-                    else:
-                        print(f'[{self.handle}]: Активные дроны: {self.network.keys()}')
+                        print(f'[{self.handle}]: дрон {handle} помечен как вышедший из строя т.к не обновлял свой статус в течении 20 секунд')
 
             
-            await asyncio.sleep(2)
+            await asyncio.sleep(10)
 
 
     async def _targeting_loop(self):
@@ -205,7 +202,7 @@ class Quadcopter:
                     tasks = [d['inst'].recieve_ping(msg) for d in self.network.values()]
                     await asyncio.gather(*tasks, return_exceptions=True)
 
-            await asyncio.sleep(3)
+            await asyncio.sleep(2)
 
 
     async def _action_loop(self):
@@ -249,7 +246,7 @@ class Quadcopter:
                     msg = await self.create_message()
                     tasks = [d['inst'].recieve_ping(msg) for d in self.network.values()]
                     await asyncio.gather(*tasks, return_exceptions=True)
-            await asyncio.sleep(1)
+            await asyncio.sleep(1.5)
                 
 
     async def recieve_done(self, tgt):
@@ -391,15 +388,14 @@ class Quadcopter:
             self.sim.getObjectQuaternion, self.handle, self.sim.handle_world)
         yaw = 2.0 * math.atan2(quat[2], quat[3])
 
-        # Вектор "вправо" в мировых координатах = курс, повернутый на -90°
         dx = math.sin(yaw) * offset
         dy = -math.cos(yaw) * offset
 
         print(f'[{self.handle}]: Обход препятствия, смещение вправо на {offset:.1f} м')
 
-        # yaw=False — не разворачиваем нос, продолжаем смотреть на препятствие
         await self.move_to(pos[0] + dx, pos[1] + dy, pos[2], yaw=False, check_obstacle=False)
 
+        await asyncio.sleep(0.3)
         self._obstacle_flag = False
         
 

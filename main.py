@@ -58,7 +58,7 @@ async def main():
         await quad2.start()
         await quad3.start()
 
-        await asyncio.sleep(55)
+        await asyncio.sleep(180)
 
     finally:
         await quad0.stop()
